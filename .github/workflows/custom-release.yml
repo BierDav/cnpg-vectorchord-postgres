@@ -1,0 +1,188 @@
+name: Build and release the cluster image
+
+on:
+  push:
+    branches: [patched]
+  # Build and test (never publish) on pull requests into patched, including
+  # fork-kit's sync PR.
+  pull_request:
+    branches: [patched]
+  workflow_dispatch:
+
+concurrency:
+  group: custom-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/bierdav/cnpg-vectorchord-postgres
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      base_tag: ${{ steps.ver.outputs.base_tag }}
+      release_tag: ${{ steps.ver.outputs.release_tag }}
+      vectorchord: ${{ steps.ver.outputs.vectorchord }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          pg="$(sed -n 's|^FROM ghcr.io/cloudnative-pg/postgresql:\([0-9.]*\)-system-trixie@.*|\1|p' Dockerfile.custom)"
+          vchord="$(sed -n 's|^ARG VECTORCHORD_VERSION=\(.*\)$|\1|p' Dockerfile.custom)"
+          test -n "$pg" && test -n "$vchord"
+          base="${pg}-vchord${vchord}"
+          git fetch --quiet --tags origin
+          max=0
+          while IFS= read -r tag; do
+            n="${tag##*-custom.}"
+            if [[ "$n" =~ ^[0-9]+$ ]] && (( n > max )); then max="$n"; fi
+          done < <(git tag -l "${base}-custom.*")
+          {
+            echo "base_tag=${base}"
+            echo "release_tag=${base}-custom.$((max + 1))"
+            echo "vectorchord=${vchord}"
+          } >> "$GITHUB_OUTPUT"
+          # Upstream's versions.yaml moves with every sync; this fork pins its own.
+          up_pg="$(grep -o '"18\.[0-9]*"' versions.yaml | tr -d '"' | head -1 || true)"
+          up_vc="$(sed -n '/^vectorchord:/,$p' versions.yaml | grep -o '"[0-9.]*"' | tr -d '"' | head -1 || true)"
+          if [[ "$up_pg" != "$pg" || "$up_vc" != "$vchord" ]]; then
+            echo "::notice::upstream builds PostgreSQL ${up_pg:-?} with VectorChord ${up_vc:-?}; this fork pins ${pg} with ${vchord} (Dockerfile.custom)"
+          fi
+
+  build:
+    needs: prepare
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.custom
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: local:${{ matrix.arch }}
+      # What the cluster relies on: user 26, and a fresh cluster that preloads
+      # vchord and creates both extensions at the pinned version.
+      - name: Test
+        env:
+          VCHORD: ${{ needs.prepare.outputs.vectorchord }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/bash -e VCHORD "local:${{ matrix.arch }}" -ec '
+            test "$(id -u)" = 26
+            export PATH=/usr/lib/postgresql/18/bin:$PATH
+            initdb -D /tmp/pg >/dev/null
+            pg_ctl -D /tmp/pg -o "-c shared_preload_libraries=vchord -k /tmp -c listen_addresses=" -w start >/dev/null
+            psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -Atc "CREATE EXTENSION vchord CASCADE"
+            got="$(psql -h /tmp -d postgres -Atc "SELECT extversion FROM pg_extension WHERE extname = '\''vchord'\''")"
+            psql -h /tmp -d postgres -Atc "SELECT extname, extversion FROM pg_extension ORDER BY 1"
+            test "$got" = "$VCHORD"
+            psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -Atc "CREATE TABLE t (v vector(3)); INSERT INTO t VALUES ('\''[1,2,3]'\''), ('\''[3,2,1]'\''); CREATE INDEX ON t USING vchordrq (v vector_l2_ops); SELECT count(*) FROM t"
+            pg_ctl -D /tmp/pg -w stop >/dev/null'
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push by digest
+        if: github.event_name != 'pull_request'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.custom
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Multi-arch manifest
+        id: manifest
+        env:
+          BASE_TAG: ${{ needs.prepare.outputs.base_tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          refs=()
+          for f in "${{ runner.temp }}/digests/"*; do refs+=("${IMAGE}@sha256:$(basename "$f")"); done
+          docker buildx imagetools create -t "${IMAGE}:${RELEASE_TAG}" -t "${IMAGE}:${BASE_TAG}" "${refs[@]}"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:${RELEASE_TAG}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Tag and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            git tag "${RELEASE_TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "${RELEASE_TAG}" \
+              --notes "**Image:** \`${IMAGE}:${RELEASE_TAG}@${DIGEST}\`"
+          fi

@@ -1,0 +1,22 @@
+# fork-kit (https://github.com/BierDav/fork-kit) keeps this fork merged with
+# upstream main through one sync pull request. BierDav/fork-kit's central
+# sync-forks workflow runs the sync; this repository holds no App key and runs
+# only the guard (.github/workflows/fork-kit.yml). See docs/custom-fork.md.
+# The fork carries no changes to upstream's files, only its own image build.
+
+[upstream]
+url = "https://github.com/tensorchord/cloudnative-vectorchord.git"
+track = "branch:main"
+
+[fork]
+branch = "patched"
+
+[ledger]
+ignore = [".github/**", "docs/custom-fork.md"]
+
+[[patch]]
+id = "trixie-image"
+summary = "PostgreSQL 18 on the Debian trixie operand with a pinned, verified VectorChord, published to ghcr.io/bierdav/cnpg-vectorchord-postgres"
+paths = ["Dockerfile.custom"]
+tests = [".github/workflows/custom-release.yml (build: CREATE EXTENSION vchord on a fresh cluster)"]
+upstream = "none"

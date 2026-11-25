@@ -1,0 +1,40 @@
+# The image the shared CloudNativePG cluster runs: CloudNativePG's PostgreSQL 18
+# operand plus VectorChord (pgvector is in the base already). Unlike upstream's
+# Dockerfile it uses the Debian trixie operand, the release the cluster runs on
+# (CloudNativePG's in-place major upgrade requires the same Debian release on
+# both sides), pins the base by digest, and verifies the VectorChord package.
+# Versions are pinned here, not taken from upstream's versions.yaml: a
+# VectorChord upgrade needs `ALTER EXTENSION vchord UPDATE` in the Photos
+# database, so it is a deliberate change (docs/custom-fork.md).
+FROM ghcr.io/cloudnative-pg/postgresql:18.2-system-trixie@sha256:3f44daf4c2ddea3481b018b3b004f91a439b93fc995a387f9aff69058bef19ac
+
+ARG TARGETARCH
+ARG VECTORCHORD_VERSION=0.5.3
+
+LABEL org.opencontainers.image.source="https://github.com/BierDav/cnpg-vectorchord-postgres"
+LABEL org.opencontainers.image.description="CloudNativePG PostgreSQL 18 (trixie) with VectorChord"
+
+USER root
+
+# The upstream release publishes separate PostgreSQL 18 packages for both
+# architectures used by the cluster. Verify the bytes before installing.
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) checksum=5323f58f22fc1882039aeb936cf0631d8a922bd1ee34042debfc9e865a2283d6 ;; \
+      arm64) checksum=1c88669550578c9b4a196cf7193c8648f6fcacc89155a934f10515f277e95dc9 ;; \
+      *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    curl -fL --retry 3 \
+      "https://github.com/supervc-stack/VectorChord/releases/download/${VECTORCHORD_VERSION}/postgresql-18-vchord_${VECTORCHORD_VERSION}-1_${TARGETARCH}.deb" \
+      -o /tmp/vchord.deb; \
+    echo "$checksum  /tmp/vchord.deb" | sha256sum -c -; \
+    apt-get install -y --no-install-recommends /tmp/vchord.deb; \
+    test -f /usr/lib/postgresql/18/lib/vchord.so; \
+    test -f /usr/share/postgresql/18/extension/vchord.control; \
+    test -f /usr/share/postgresql/18/extension/vector.control; \
+    rm -f /tmp/vchord.deb; \
+    rm -rf /var/lib/apt/lists/* /var/cache/* /var/log/*
+
+USER 26
